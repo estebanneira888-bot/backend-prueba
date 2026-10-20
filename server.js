@@ -1,8 +1,10 @@
-
 import express from "express";
 import * as dotenv from "dotenv";
 import cors from "cors";
 import morgan from "morgan";
+import path from "path";
+import fs from "fs";
+import { fileURLToPath } from "url";
 
 import dbConnection from "./database.js";
 import { validateJWT } from "./middlewares/validateJWT.js";
@@ -12,172 +14,101 @@ import { routerAprendiz } from "./routes/aprendices.routes.js";
 
 dotenv.config();
 
+// En modulos ES no existe __dirname; se reconstruye a partir de import.meta.url.
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Representa el servidor de la aplicacion.
+ * @class
+ */
 class Server {
+  /**
+   * @constructor
+   */
   constructor() {
     this.app = express();
     this.port = process.env.PORT || 4500;
-
+    // Carpeta con el frontend ya compilado. El build del frontend se copia aqui
+    // (ver "npm run deploy:backend" en el frontend) y este mismo servidor lo sirve.
+    this.publicPath = path.join(__dirname, "public");
     this.middlewares();
     this.routes();
     this.conexionBd();
   }
 
+  /**
+   * Middlewares globales (se ejecutan en TODAS las peticiones).
+   */
   middlewares() {
-    this.app.use(express.json());
+    this.app.use(express.json()); // permite leer req.body en formato JSON
     this.app.use(express.urlencoded({ extended: true }));
+    this.app.use(cors()); // permite que el frontend (otro puerto) consuma la API
+    this.app.use(morgan("dev")); // muestra en consola cada peticion que llega
 
-    const frontendUrl = process.env.URL_FRONTEND;
-
-    this.app.use(
-      cors(
-        frontendUrl
-          ? {
-              origin: frontendUrl.split(",").map((o) => o.trim()),
-            }
-          : {}
-      )
-    );
-
-    this.app.use(
-      morgan((tokens, req, res) => {
-        return [
-          tokens.method(req, res),
-          tokens.url(req, res),
-          tokens.status(req, res),
-          tokens["response-time"](req, res) + " ms",
-        ].join(" ");
-      })
-    );
+    // Sirve el frontend ya compilado (index.html, /assets, favicon...). Si aun
+    // no has copiado el build, la carpeta "public" no existe y esto simplemente
+    // no sirve nada; util en desarrollo, cuando el frontend corre aparte con
+    // "npm run dev" en el puerto 5173.
+    this.app.use(express.static(this.publicPath));
   }
 
+  /**
+   * Registra las rutas de la aplicacion.
+   * Cada modelo tiene su propio router montado bajo /api/<recurso>
+   *
+   * Aqui se ve de un vistazo QUE ESTA PROTEGIDO: el middleware validateJWT se
+   * pone entre la URL y el router. Todo lo que pase por ahi necesita mandar la
+   * cabecera x-token; si no, corta con un 401 y el controlador ni se entera.
+   */
   routes() {
-    this.app.get("/", (req, res) => {
-      console.log("");
-      console.log("========================================");
-      console.log("PETICION RECIBIDA: GET /");
-      console.log("========================================");
-
-      res.status(404).json({
-        msg: "La ruta solicitada no existe",
-      });
-    });
-
-    this.app.get("/life", (req, res) => {
-      console.log("");
-      console.log("Servidor funcionando correctamente");
-
-      res.status(200).json({
-        msg: "El servidor esta funcionando",
-      });
-    });
-
+    // Publico: es por donde se consigue el token.
     this.app.use("/api/usuarios", routerUsuario);
 
+    // Privado: requieren token.
     this.app.use("/api/cursos", validateJWT, routerCurso);
-
     this.app.use("/api/aprendices", validateJWT, routerAprendiz);
 
+    // Ruta de cortesia para comprobar rapido que el servidor responde.
+    // El nombre "/life" es un identificador y no se traduce; el mensaje si.
+    this.app.use("/life", (req, res) => {
+      res.send("El servidor esta funcionando");
+    });
+
+    // Una ruta de API (/api/...) que no coincide con las de arriba cae aqui y
+    // responde 404 en JSON. Este msg lo muestra el frontend tal cual en un
+    // Notify, por eso va en español igual que los demas mensajes del backend.
     this.app.use("/api/*", (req, res) => {
-      console.log("");
-      console.log("========================================");
-      console.log("ERROR 404");
-      console.log("Ruta no encontrada:");
-      console.log(req.method + " " + req.originalUrl);
-      console.log("========================================");
-
-      res.status(404).json({
-        msg: "La ruta solicitada no existe",
-      });
+      res.status(404).json({ msg: "La ruta solicitada no existe" });
     });
 
-    this.app.use((req, res) => {
-      console.log("");
-      console.log("========================================");
-      console.log("ERROR 404");
-      console.log("Ruta no encontrada:");
-      console.log(req.method + " " + req.originalUrl);
-      console.log("========================================");
-
-      res.status(404).json({
-        msg: "La ruta solicitada no existe",
-      });
-    });
-
-    this.app.use((err, req, res, next) => {
-      console.error("");
-      console.error("========================================");
-      console.error("ERROR INTERNO DEL SERVIDOR");
-      console.error("========================================");
-      console.error(err);
-      console.error("========================================");
-      console.error("");
-
-      res.status(err?.status || 500).json({
-        msg: "Error interno del servidor",
-      });
+    // Cualquier OTRA ruta devuelve el index.html del frontend, para que se abra
+    // la aplicacion de Vue (asi tambien funciona entrar por una URL directa,
+    // ademas del modo hash que usa el router). Si todavia no se ha copiado el
+    // build, la carpeta public no existe y responde como antes (util en dev).
+    this.app.get("*", (req, res) => {
+      const indexHtml = path.join(this.publicPath, "index.html");
+      if (fs.existsSync(indexHtml)) {
+        return res.sendFile(indexHtml);
+      }
+      res.status(404).json({ msg: "La ruta solicitada no existe" });
     });
   }
 
+  /**
+   * Conecta a la base de datos.
+   */
   async conexionBd() {
-    if (!process.env.MONGO_URL) {
-      console.error("");
-      console.error("========================================");
-      console.error("ERROR DE CONFIGURACION");
-      console.error("Falta MONGO_URL en el archivo .env");
-      console.error("========================================");
-      console.error("");
-
-      return;
-    }
-
-    if (!process.env.SECRETORPRIVATEKEY) {
-      console.error("");
-      console.error("========================================");
-      console.error("ERROR DE CONFIGURACION");
-      console.error("Falta SECRETORPRIVATEKEY en el archivo .env");
-      console.error("========================================");
-      console.error("");
-    }
-
-    try {
-      await dbConnection();
-
-      console.log("");
-      console.log("========================================");
-      console.log("BASE DE DATOS");
-      console.log("Conectado a MongoDB correctamente");
-      console.log("========================================");
-      console.log("");
-    } catch (error) {
-      console.error("");
-      console.error("========================================");
-      console.error("ERROR DE BASE DE DATOS");
-      console.error("No se pudo conectar a MongoDB");
-      console.error("========================================");
-      console.error(error);
-      console.error("");
-    }
+    await dbConnection();
   }
 
+  /**
+   * Inicia el servidor.
+   */
   listen() {
     this.app.listen(this.port, () => {
-      console.log("");
-      console.log("========================================");
-      console.log("         SERVIDOR INICIADO");
-      console.log("========================================");
-      console.log(`Servidor: http://localhost:${this.port}`);
-      console.log("");
-      console.log("Rutas disponibles:");
-      console.log(`GET  http://localhost:${this.port}/life`);
-      console.log(`POST http://localhost:${this.port}/api/usuarios/login`);
-      console.log(`POST http://localhost:${this.port}/api/usuarios/register`);
-      console.log(`GET  http://localhost:${this.port}/api/cursos`);
-      console.log(`GET  http://localhost:${this.port}/api/aprendices`);
-      console.log("========================================");
-      console.log("");
+      console.log(`Servidor en http://localhost:${this.port}`);
     });
   }
 }
 
 export default Server;
-
